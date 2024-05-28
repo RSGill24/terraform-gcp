@@ -1,0 +1,244 @@
+data "aws_subnets" "eks" {
+  filter {
+    name   = "tag:Name"
+    values = toset(var.eks.control_plane_subnets)
+  }
+}
+ 
+resource "aws_eks_cluster" "cluster" {
+  name     = var.eks.cluster_name
+  role_arn = var.eks.cluster_role_arn
+  version  = var.eks.kubernetes_version
+ 
+  access_config {
+    authentication_mode = "API_AND_CONFIG_MAP"
+  }
+ 
+  vpc_config {
+    endpoint_private_access = true
+    endpoint_public_access  = false
+    security_group_ids      = []
+    subnet_ids              = data.aws_subnets.eks.ids
+  }
+ 
+  kubernetes_network_config {
+    service_ipv4_cidr = var.eks.pod_srvc_cidr_block
+    ip_family         = "ipv4"
+  }
+ 
+  tags = {
+    Name = var.eks.cluster_name
+  }
+}
+ 
+# Must wait a few more seconds for cluster to be ready
+# despite the fact that it reached 'Active' status
+resource "time_sleep" "wait_15_seconds" {
+  depends_on = [aws_eks_cluster.cluster]
+ 
+  create_duration = "15s"
+}
+ 
+data "aws_kms_key" "cloudwatch" {
+  key_id = "alias/accelerator/kms/cloudwatch/key"
+}
+ 
+resource "aws_cloudwatch_log_group" "eks" {
+  name              = "/aws/eks/${var.eks.cluster_name}/cluster"
+  retention_in_days = var.eks.cloudwatch_log_retention_in_days
+  kms_key_id        = data.aws_kms_key.cloudwatch.arn
+}
+ 
+resource "aws_eks_access_entry" "eks" {
+  # provisioner "local-exec" { command = "echo 'Wait 60 seconds for cluster to be fully active...'; sleep 60" }
+  for_each = { for u in var.eks.admin_role_cluster_arns : u => u }
+ 
+  cluster_name  = var.eks.cluster_name
+  principal_arn = each.value
+  type          = "STANDARD"
+ 
+  depends_on = [
+    aws_eks_cluster.cluster,
+    time_sleep.wait_15_seconds
+  ]
+}
+ 
+resource "aws_eks_access_policy_association" "eks" {
+  for_each = { for u in var.eks.admin_role_cluster_arns : u => u }
+ 
+  cluster_name  = var.eks.cluster_name
+  policy_arn    = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy"
+  principal_arn = each.value
+ 
+  access_scope {
+    type = "cluster"
+  }
+ 
+  depends_on = [
+    aws_eks_access_entry.eks
+  ]
+}
+ 
+resource "aws_ec2_tag" "eks_created_security_group_tag" {
+  resource_id = aws_eks_cluster.cluster.vpc_config[0].cluster_security_group_id
+  key         = "Name"
+  value       = var.eks.sg_name
+}
+ 
+data "aws_ami" "node" {
+  most_recent = true
+ 
+  filter {
+    name   = "name"
+    values = [var.eks.ltmp.ami_filter_name]
+  }
+ 
+  filter {
+    name   = "description"
+    values = ["EKS Kubernetes Worker AMI*"]
+  }
+ 
+  filter {
+    name   = "root-device-type"
+    values = ["ebs"]
+  }
+ 
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
+ 
+  filter {
+    name   = "architecture"
+    values = ["x86_64"]
+  }
+ 
+  filter {
+    name   = "image-type"
+    values = ["machine"]
+  }
+}
+ 
+resource "aws_launch_template" "eks_node" {
+  name          = var.eks.ltmp.name
+  image_id      = data.aws_ami.node.id
+  instance_type = var.eks.ltmp.instance_type
+  key_name      = var.eks.ltmp.key_name
+ 
+  update_default_version = true
+ 
+  user_data = base64encode(var.eks.ltmp.user_data)
+ 
+  dynamic "block_device_mappings" {
+    for_each = [for ebs in var.eks.ltmp.ebs : {
+      device_name           = ebs.device_name
+      delete_on_termination = ebs.delete_on_termination
+      encrypted             = ebs.encrypted
+      volume_size           = ebs.volume_size
+      volume_type           = ebs.volume_type
+    }]
+    content {
+      device_name = block_device_mappings.value.device_name
+      ebs {
+        delete_on_termination = block_device_mappings.value.delete_on_termination
+        encrypted             = block_device_mappings.value.encrypted
+        volume_size           = block_device_mappings.value.volume_size
+        volume_type           = block_device_mappings.value.volume_type
+      }
+    }
+  }
+ 
+  tag_specifications {
+    resource_type = "instance"
+ 
+    tags = {
+      Name = var.eks.node_name
+    }
+  }
+ 
+  metadata_options {
+    http_endpoint               = "enabled"
+    http_tokens                 = "required"
+    http_put_response_hop_limit = 2
+    instance_metadata_tags      = "enabled"
+  }
+ 
+  lifecycle {
+    create_before_destroy = true
+  }
+ 
+  tags = {
+    Name = var.eks.ltmp.name
+  }
+}
+ 
+ 
+resource "aws_eks_node_group" "node_group" {
+  # provisioner "local-exec" { command = "echo 'Wait 60 seconds for cluster to be fully active...'; sleep 60" }
+ 
+  cluster_name    = var.eks.cluster_name
+  node_group_name = var.eks.node_group_name
+  node_role_arn   = var.eks.node_role_arn
+  scaling_config {
+    desired_size = var.eks.node_group_default_desired_size
+    max_size     = var.eks.node_group_default_max_size
+    min_size     = var.eks.node_group_default_min_size
+  }
+  subnet_ids    = data.aws_subnets.eks.ids
+  capacity_type = var.eks.capacity_type #ON_DEMAND, SPOT
+ 
+  launch_template {
+    name    = aws_launch_template.eks_node.name
+    version = aws_launch_template.eks_node.latest_version
+  }
+ 
+  tags = {
+    Name = var.eks.node_group_name
+  }
+ 
+  depends_on = [
+    aws_eks_cluster.cluster,
+    aws_eks_access_policy_association.eks,
+    time_sleep.wait_15_seconds
+  ]
+ 
+}
+ 
+resource "null_resource" "delete_cluster_node_group" {
+  triggers = {
+    cluster_name    = var.eks.cluster_name
+    node_group_name = var.eks.node_group_name
+  }
+ 
+  provisioner "local-exec" {
+    when       = destroy
+    command    = "aws eks delete-nodegroup --cluster-name ${self.triggers.cluster_name} --nodegroup-name ${self.triggers.node_group_name}"
+    on_failure = continue
+  }
+}
+ 
+# Must wait a few more minutes for node_groups to be ready
+# despite the fact that it reached 'Active' status
+resource "time_sleep" "wait_4_minutes" {
+  depends_on      = [aws_eks_cluster.cluster]
+  create_duration = "4m"
+}
+ 
+resource "aws_eks_addon" "addon" {
+  count                = length(var.eks.addons)
+  cluster_name         = aws_eks_cluster.cluster.name
+  addon_name           = var.eks.addons[count.index].name
+  addon_version        = var.eks.addons[count.index].version
+  resolve_conflicts    = "OVERWRITE"
+  configuration_values = var.eks.addons[count.index].configuration_values
+ 
+  tags = {
+    Name = "eks-addon-${var.eks.addons[count.index].name}"
+  }
+ 
+  depends_on = [
+    aws_eks_cluster.cluster,
+    aws_eks_node_group.node_group,
+    time_sleep.wait_4_minutes
+  ]
+}
